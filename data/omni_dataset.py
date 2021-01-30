@@ -14,9 +14,10 @@ from functools import lru_cache
 import os
 
 import sys
-sys.path.insert(0, '/home/bo/research/realtime-action-detection')
+sys.path.insert(0, '/home/monet/research/realtime-action-detection')
 from utils.augmentations import SSDAugmentation
 import collections
+from PIL import Image
 
 def genuv(h, w):
     u, v = np.meshgrid(np.arange(w), np.arange(h))
@@ -109,7 +110,7 @@ def IoU(bbox1,bbox2,outshape=(300,600),inshape=(300,300),fov=np.pi/3):
 
 
 
-def uv2img_idx(uv, h, w, u_fov, v_fov, rot_x=0, rot_y=0, rot_z=0):
+def rotated_coord(uv, h, w, u_fov, v_fov, rot_x=0, rot_y=0, rot_z=0):
     # the coord on sphere of each pixel in the output image
     xyz = uv2xyz(uv.astype(np.float64)) # out_h, out_w, (x,y,z)
 
@@ -145,42 +146,82 @@ def uv2img_idx(uv, h, w, u_fov, v_fov, rot_x=0, rot_y=0, rot_z=0):
               (v < -v_fov / 2) | (v > v_fov / 2) 
     x[invalid] = -1
     y[invalid] = -1
+    # every entry is a coord
 
     return np.stack([y, x], axis=0),x,y
+
+def GreatCircleDist(uv1, uv2):
+    u1,v1 = uv1
+    u2,v2 = uv2
+    x1,y1,z1 = np.cos(v1)*np.cos(u1),np.cos(v1)*np.sin(u1),np.sin(v1)
+    x2,y2,z2 = np.cos(v2)*np.cos(u2),np.cos(v2)*np.sin(u2),np.sin(v2)
+    d = ((x1-x2)**2+(y1-y2)**2+(z1-z2)**2)**0.5
+    phi = np.arcsin(d/2)
+    return phi*2
+
 
 
 class OmniDataset(data.Dataset):
     def __init__(self, dataset, fov=120, outshape=(512, 2*512),
                  z_rotate=True, y_rotate=True, x_rotate=False,
-                 fix_aug=False, use_background=True, num_bgs=22, save_final_annot=True):
+                 fix_aug=False, use_background=True, num_bgs=22, save_final_annot=True, use_npy=False):
         '''
         Convert classification dataset to omnidirectional version
         @dataset  dataset with same interface as torch.utils.data.Dataset
                   yield (PIL image, label) if indexing
         '''
-        self.dataset = dataset
-        self.ids = dataset.ids
-        self.video_list = dataset.video_list
+        # if use npy file to store images and labels
+        if use_npy:
+            # save np.load
+            np_load_old = np.load
+
+            # modify the default parameters of np.load
+            np.load = lambda *a,**k: np_load_old(*a, allow_pickle=True, **k)
+
+
+            img_file,label_file,index_file = 'img_file.npy', 'label_file.npy', 'index_file.npy'
+            # with open(img_file, 'rb') as f:
+            #     self.imgs = np.load(f)
+            self.imgs = None
+            with open(label_file, 'rb') as f:
+                self.labels = np.load(f)
+            with open(index_file, 'rb') as f:
+                self.indexes = np.load(f)
+            d=np.load("dataset.npy").item()
+            self.ids = d['ids']
+            self.video_list = d['video_list']
+            self.root = d['root']
+            self.name = d['name']
+
+            # restore np.load for future normal usage
+            np.load = np_load_old
+            print(self.indexes.shape[0],"images loaded.")
+            return 
+        else:
+            self.dataset = dataset
+            self.ids = dataset.ids
+            self.video_list = dataset.video_list
+            self.root = dataset.root
+            self.name = dataset.name
+
         self.fov = fov
         self.outshape = outshape
         self.z_rotate = z_rotate
         self.y_rotate = y_rotate
         self.x_rotate = x_rotate
-        self.name = dataset.name
         self.use_background = use_background
-        self.video_list = dataset.video_list
-        self.ids = dataset.ids
-        self.root = dataset.root
         # self.annot_map = collections.defaultdict(dict)
-        self.user = '/home/bo/'
+        self.user = '/home/monet/'
+        self.use_npy = False
+
 
         self.aug = None
         if fix_aug:
             self.aug = [
                 {
-                    'z_rotate': np.random.uniform(-np.pi, np.pi),
-                    'y_rotate': np.random.uniform(-np.pi/2, np.pi/2),
-                    'x_rotate': np.random.uniform(-np.pi, np.pi),
+                    'z_rotate': 0,#np.random.uniform(-np.pi, np.pi),
+                    'y_rotate': 0,#np.random.uniform(-np.pi/2, np.pi/2),
+                    'x_rotate': 0,#np.random.uniform(-np.pi, np.pi),
                 }
                 for _ in range(len(self.dataset))
             ]
@@ -195,16 +236,39 @@ class OmniDataset(data.Dataset):
             self.bg_imgs += [bg_img]
 
         # map video to background
+        L = len(self.video_list)
         self.vid2bgidx = {}
-        for vid in range(len(self.video_list)):
+        for vid in range(L):
             self.vid2bgidx[vid] = np.random.randint(0,22)
+
+        # map video to number of frames in a video
+        # map video to starting frame index,
+        self.video_start = {}
+        self.vid2totalframe = collections.defaultdict(int)
+        prev_vid = -1
+        for i,annot_info in enumerate(self.ids):
+            video_id = annot_info[0]
+            if video_id != prev_vid:
+                self.video_start[video_id] = i
+            prev_vid = video_id
+            self.vid2totalframe[video_id] += 1
+
+        # map video to another friend video
+        self.friend_video = {}
+        video_ids = list(self.video_start.keys())
+        num_videos = len(video_ids)
+        for i in range(num_videos):
+            one = video_ids[i]
+            two = video_ids[(i + np.random.randint(1,num_videos))%num_videos]
+            self.friend_video[one] = two
+            assert(one!=two)
 
         # map video to rotation
         self.vid2rot = {}
         for vid in range(len(self.video_list)):
             if self.y_rotate:
                 if self.aug is not None:
-                    rot_y = self.aug[idx]['y_rotate']
+                    rot_y = self.aug[vid]['y_rotate']
                 else:
                     rot_y = np.random.uniform(-np.pi/2, np.pi/2)
             else:
@@ -212,7 +276,7 @@ class OmniDataset(data.Dataset):
 
             if self.z_rotate:
                 if self.aug is not None:
-                    rot_z = self.aug[idx]['z_rotate']
+                    rot_z = self.aug[vid]['z_rotate']
                 else:
                     rot_z = np.random.uniform(-np.pi, np.pi)
             else:
@@ -220,13 +284,57 @@ class OmniDataset(data.Dataset):
 
             if self.x_rotate:
                 if self.aug is not None:
-                    rot_x = self.aug[idx]['x_rotate']
+                    rot_x = self.aug[vid]['x_rotate']
                 else:
                     rot_x = np.random.uniform(-np.pi, np.pi)
             else:
                 rot_x = 0
 
-            self.vid2rot[vid] = (rot_x,rot_y,rot_z)
+            self.vid2rot[vid] = [(rot_x,rot_y,rot_z)]
+
+            while True:
+                rot_y2 = np.random.uniform(-np.pi/2, np.pi/2) 
+                rot_z2 = np.random.uniform(-np.pi, np.pi)
+                rot_x2 = 0
+                if GreatCircleDist((rot_z,rot_y),(rot_z2,rot_y2))>=1.7:break
+            self.vid2rot[vid] += [(rot_x2,rot_y2,rot_z2)]
+
+        # try to save data in file len(self.ids)
+        # print('Start building dataset...')
+        # imgs, labels, indexes = [],[],[]
+        # prev_vid = -1
+        # v_cnt,max_video = 0,50
+        # for idx in range(len(self.ids)):
+        #     print(idx)
+        #     annot_info = self.ids[idx]
+        #     video_id = annot_info[0]
+        #     if video_id != prev_vid:
+        #         prev_vid = video_id
+        #         v_cnt += 1
+        #         if v_cnt >= max_video:
+        #             break
+        #     img, label, index = self._transform_item(idx)
+        #     pil_img = Image.fromarray(img.cpu().permute(1, 2, 0).numpy().astype(np.uint8))
+        #     pil_img.save('../dataset/{:05d}.png'.format(idx))
+        #     labels.append(label)
+        #     indexes.append(index)
+
+        # labels = np.array(labels)
+        # indexes = np.array(indexes)
+        # print(indexes.shape)
+        # with open('label_file.npy','wb') as f:
+        #     np.save(f, labels)
+        # with open('index_file.npy','wb') as f:
+        #     np.save(f, indexes)
+        # d = {}
+        # d['ids'] = dataset.ids
+        # d['video_list'] = dataset.video_list
+        # d['root'] = dataset.root
+        # d['name'] = dataset.name
+        # np.save("dataset.npy", d)
+        # exit(0)
+
+        # end
 
         # # save jhmdb convereted data in cache
         # if self.dataset.image_set == 'test' and self.name == 'jhmdb':
@@ -261,7 +369,7 @@ class OmniDataset(data.Dataset):
         #             uv = genuv(*self.outshape) # out_h, out_w, (out_phi, out_theta)
         #             fov = self.fov * np.pi / 180
 
-        #             img_idx, x, y = uv2img_idx(uv, h, w, fov, fov, *self.vid2rot[vid])
+        #             img_idx, x, y = rotated_coord(uv, h, w, fov, fov, *self.vid2rot[vid])
 
         #             label = self._transform_label([old_label],x, y)[0]
         #             new_boxes.append([int(label[0]*1024),int(label[1]*512),int(label[2]*1024),int(label[3]*512)])
@@ -292,7 +400,7 @@ class OmniDataset(data.Dataset):
         #         uv = genuv(*self.outshape) # out_h, out_w, (out_phi, out_theta)
         #         fov = self.fov * np.pi / 180
 
-        #         img_idx, x, y = uv2img_idx(uv, h, w, fov, fov, *self.vid2rot[video_id])
+        #         img_idx, x, y = rotated_coord(uv, h, w, fov, fov, *self.vid2rot[video_id])
 
         #         label = self._transform_label(label,x, y)
         #         old_label = self.ids[idx][3]
@@ -328,10 +436,13 @@ class OmniDataset(data.Dataset):
         #     exit(0)
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.ids)
 
     def __getitem__(self, idx):
-        img, label, index = self._transform_item(idx)
+        if self.use_npy:
+            img, label, index = None, torch.from_numpy(self.labels[idx]), self.indexes[idx]
+        else:
+            img, label, index = self._transform_item(idx)
         return img, label, index
 
     def get_rotation(self, video_id):
@@ -342,47 +453,63 @@ class OmniDataset(data.Dataset):
         video_id = annot_info[0]
         videoname = self.video_list[video_id]
 
-        rot_x,rot_y,rot_z = self.vid2rot[video_id]
+        # friend video
+        fvid = self.friend_video[video_id]
+        target_index = self.video_start[fvid] + idx - self.video_start[video_id]
+        last_index = self.video_start[fvid] + self.vid2totalframe[fvid] - 1
 
+        # images for patching
+        imgs = [self.dataset[idx]]
+        if last_index>=target_index:
+            imgs += [self.dataset[fvid]]
+        else:
+            imgs += [None]
+
+        # use background image
         bg_img = None
         if self.use_background:
             bg_idx = self.vid2bgidx[video_id]
             bg_img = self.bg_imgs[bg_idx]
 
-        img, label, index = self.dataset[idx]
-
-        h, w = img.shape[1:]
+        # prepare for translation
+        h = w = 300
         uv = genuv(*self.outshape) # out_h, out_w, (out_phi, out_theta)
         fov = self.fov * np.pi / 180
 
-        img_idx, x, y = uv2img_idx(uv, h, w, fov, fov, rot_x, rot_y, rot_z)
+        invalid = None
+        img_stack = [None for ch in range(3)]
+        new_labels = []
+        for i,(rot_x,rot_y,rot_z) in enumerate(self.vid2rot[video_id]):
+            # fetch 2d image
+            if imgs[i] is None:break
+            img, label, index = imgs[i]
+            img_idx, x, y = rotated_coord(uv, h, w, fov, fov, rot_x, rot_y, rot_z)
 
-        invalid = (x < 0) | (x > w) | (y < 0) | (y > h)
+            if invalid is None:
+                invalid = (x < 0) | (x > w) | (y < 0) | (y > h)
+            else:
+                invalid &= ((x < 0) | (x > w) | (y < 0) | (y > h))
 
-        img_stack = []
-        for ch in range(img.shape[0]):
-            _img = img[ch,:,:]
-            
-            _img = map_coordinates(_img, img_idx, order=1)
+            for ch in range(img.shape[0]):
+                tmp = map_coordinates(img[ch,:,:], img_idx, order=1) 
+                if img_stack[ch] is None:
+                    img_stack[ch] = tmp
+                else:
+                    img_stack[ch] += tmp
 
-            if bg_img is not None:
+            new_labels += self._transform_label(label,x, y)
+
+        if bg_img is not None:
+            for ch in range(3):
+                _img = img_stack[ch]
                 means = (104, 117, 123)
                 bg_img_ch = bg_img[:,:,2-ch]
                 _img[invalid] = bg_img_ch[invalid] - means[2-ch]
 
-            # for x1,y1,x2,y2,c in label:
-            #     x1*=300
-            #     x2*=300
-            #     y1*=300
-            #     y2*=300
-            #     bbox = (x > x1) & (x < x2) & (y < y2) & (y > y1)
-            #     _img[bbox] = 255
-
-            img_ch = torch.FloatTensor(_img.copy())
-            img_stack.append(img_ch.unsqueeze(0))
+        for ch in range(3):
+            img_stack[ch] = torch.FloatTensor(img_stack[ch]).unsqueeze(0)
         img = torch.cat(img_stack, dim=0)
-        new_labels = self._transform_label(label,x, y)
-
+        
         return img, new_labels, index
 
     def _transform_label(self, bboxes, x, y):
@@ -431,10 +558,13 @@ from data import UCF24Detection, AnnotationTransform, BaseTransform, JHMDB
 
 class OmniUCF24(OmniDataset):
     def __init__(self, root, image_set, transform=None, target_transform=None,
-                 dataset_name='ucf24', input_type='rgb', full_test=False, *args, **kwargs):
-        self.UCF24 = UCF24Detection(root, image_set, transform, target_transform,
-                                    dataset_name, input_type, full_test)
-        super(OmniUCF24, self).__init__(self.UCF24, *args, **kwargs)
+                 dataset_name='ucf24', input_type='rgb', full_test=False, use_npy=False, *args, **kwargs):
+        if not use_npy:
+            self.UCF24 = UCF24Detection(root, image_set, transform, target_transform,
+                                        dataset_name, input_type, full_test)
+            super(OmniUCF24, self).__init__(self.UCF24, *args, **kwargs)
+        else:
+            super(OmniUCF24, self).__init__(None, use_npy=use_npy, *args, **kwargs)
 
 class OmniJHMDB(OmniDataset):
     def __init__(self, root, image_set, transform=None, target_transform=None, *args, **kwargs):
@@ -476,7 +606,7 @@ if __name__ == '__main__':
 
     args.train_sets = 'train'
     args.means = (104, 117, 123)
-    np.random.seed(111)
+    np.random.seed(112)
 
     if args.dataset == 'OmniUCF24':
         args.data_root = '/home/bo/research/dataset/ucf24/'
@@ -511,6 +641,13 @@ if __name__ == '__main__':
             y = (y1+y2)/2
             w = x2-x1
             h = y2-y1
-            draw.rectangle(((x1, y1), (x2, y2)), fill="black")
+            draw.rectangle(((x1, y1), (x2, y2)), fill=None, outline ="black")
 
         img.save(path)
+
+        # loaded_img = Image.open(path)
+
+        # b,g,r = cv2.split(np.array(loaded_img))
+        # frame_rgb = cv2.merge((r,g,b))
+        # cv2.imshow('Edge sending window',frame_rgb)
+        # cv2.waitKey(0)

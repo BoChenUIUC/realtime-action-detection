@@ -696,6 +696,8 @@ def get_PR_curve(annot, xmldata,checkpoint):
         dt_label = dt_labels[dtind] - 1
         # the tube having the max score decides
         # the label of the video
+        # this does not matter now since we 
+        # have different actions in a video
         if dt_tubes['score'][dtind] > maxscore:
             pred = dt_label
             maxscore = dt_tubes['score'][dtind]
@@ -708,6 +710,11 @@ def get_PR_curve(annot, xmldata,checkpoint):
             action_id = gt_tubes[gtind][2] - 1#class
             # if this gt tube is not covered and has the same label as this detected tube
             if (not covered_gt_tubes_portion[gtind]) and dt_label == action_id:
+                # if this is greater than the number of frames in a video
+                # it should be changed to that
+                # should keep the nubmer of frames in each video
+                # todo
+                # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!1
                 gt_fnr = range(gt_tubes[gtind][0][0][0] - gt_tubes[gtind][1][0][0] + 1)
                 gt_bb = gt_tubes[gtind][3]
                 iou = compute_spatial_temporal_iou(gt_fnr,gt_bb,dt_fnr,dt_bb)
@@ -716,6 +723,7 @@ def get_PR_curve(annot, xmldata,checkpoint):
                     ioumax = iou
                     maxgtind = gtind
 
+        # differnet IoU thresholds
         if ioumax > 0.2:
             covered_gt_tubes_portion[gtind] = 1
             # records the score,T/F of each dt tube at every step for every class
@@ -750,6 +758,7 @@ def get_PR_curve(annot, xmldata,checkpoint):
                         maxgtind = gtind
 
             for iouth in IoUTHs:
+                # success detection
                 if ioumax > iouth:
                     covered_gt_tubes[gtind] = 1
                     # records the score,T/F of each dt tube at every step for every class
@@ -762,6 +771,7 @@ def get_PR_curve(annot, xmldata,checkpoint):
     gts[checkpoint].append(gt)
     return int(pred==gt)
 
+# analyze existing PR curves
 def evaluate_tubes(outfile):
     actions = CLASSES
     numActions = len(CLASSES)
@@ -937,7 +947,6 @@ def process_video_result(video_result,outfile,iteration,annot_map):
     gt_tube = annot[2][0]
     for gtind in range(len(gt_tube)):
         action_id = gt_tube[gtind][2][0][0]
-        assert(action_id > 0)
         action_id -= 1
         total_num_gt_tubes[action_id] += 1
 
@@ -945,21 +954,13 @@ def process_video_result(video_result,outfile,iteration,annot_map):
     ends = [stride*i for i in range(1,10)] + [len(frame_det_res)]
 
     results = []
-    for i,end in enumerate(ends):
-        if i==9:
-            t1 = time.perf_counter()
-            allPath = actionPath(frame_det_res[:end])
-            res = getTubes(allPath,annot,i)
-            results.append(res)
-            t2 = time.perf_counter()
-            tubeGenTime.append((t2-t1)/len(frame_det_res))
-            print(t2-t1)
-        else:
-            # only evaluate full path
-            continue
-            # allPath = actionPath(frame_det_res[:end])
-            # res = getTubes(allPath,annot,i)
-            # results.append(res)
+    t1 = time.perf_counter()
+    allPath = actionPath(frame_det_res)
+    res = getTubes(allPath,annot,9)
+    results.append(res)
+    t2 = time.perf_counter()
+    tubeGenTime.append((t2-t1)/len(frame_det_res))
+    print(t2-t1)
 
     print(len(tubeGenTime),results,tubeGenTime[-1])
 
